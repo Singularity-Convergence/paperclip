@@ -16,10 +16,6 @@ import {
   heartbeatService,
   issueApprovalService,
   logActivity,
-  rejectionGuardService,
-  REJECTION_GUARD_BLOCK_MESSAGE,
-  REJECTION_GUARD_BLOCK_REASON,
-  shouldEnforceRejectionGuard,
   secretService,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
@@ -54,7 +50,6 @@ export function approvalRoutes(
     pluginWorkerManager: options.pluginWorkerManager,
   });
   const issueApprovalsSvc = issueApprovalService(db);
-  const rejectionGuard = rejectionGuardService(db);
   const secretsSvc = secretService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
@@ -118,32 +113,6 @@ export function approvalRoutes(
     res.json(result.map((approval) => redactApprovalPayload(approval)));
   });
 
-  // SIN-2096 P3 — rejected-SIN history query.
-  // Returns recent rejections whose fingerprint matches the requested SIN id.
-  // Same-company firewall: companyId is taken from the URL, never derived from
-  // user input. This endpoint is the routine-layer defense-in-depth read path.
-  router.get("/companies/:companyId/approvals/rejection-history", async (req, res) => {
-    const companyId = req.params.companyId as string;
-    assertCompanyAccess(req, companyId);
-    const sinId = typeof req.query.sinId === "string" ? req.query.sinId : null;
-    if (!sinId) {
-      res.status(400).json({ error: "sinId query parameter is required" });
-      return;
-    }
-    const token = rejectionGuard.extractSinToken(sinId);
-    if (!token) {
-      res.json({ fingerprintSinId: null, matches: [] });
-      return;
-    }
-    const sinceRaw = typeof req.query.since === "string" ? req.query.since : null;
-    const since = sinceRaw ? new Date(sinceRaw) : null;
-    const matches = await rejectionGuard.lookupRecentRejections(companyId, token);
-    const filtered = since
-      ? matches.filter((m) => m.rejectedAt.getTime() >= since.getTime())
-      : matches;
-    res.json({ fingerprintSinId: token, matches: filtered });
-  });
-
   router.get("/approvals/:id", async (req, res) => {
     const id = req.params.id as string;
     const approval = await svc.getById(id);
@@ -177,71 +146,12 @@ export function approvalRoutes(
         : approvalInput.payload;
 
     const actor = getActorInfo(req);
-
-    // SIN-2096 P3 — rejected-SIN approval guard (server-side hook, primary).
-    // Same-company memory firewall: we query the local approvals table for the
-    // same companyId. We never call cross-company endpoints from here.
-    const willRequestedByUserId = actor.actorType === "user" ? actor.actorId : null;
-    const willRequestedByAgentId =
-      approvalInput.requestedByAgentId ?? (actor.actorType === "agent" ? actor.actorId : null);
-    if (
-      shouldEnforceRejectionGuard({
-        requestedByUserId: willRequestedByUserId,
-        requestedByAgentId: willRequestedByAgentId,
-        payload: (normalizedPayload ?? {}) as Record<string, unknown>,
-      })
-    ) {
-      const verdict = await rejectionGuard.check(companyId, (normalizedPayload ?? {}) as Record<string, unknown>);
-      if (verdict.matched) {
-        const latestMatch = verdict.matches[0]!;
-        logger.warn(
-          {
-            companyId,
-            actorType: actor.actorType,
-            actorId: actor.actorId,
-            fingerprintSinId: verdict.fingerprintSinId,
-            rejectedApprovalId: latestMatch.approvalId,
-            rejectedAt: latestMatch.rejectedAt,
-            requestedByAgentId: willRequestedByAgentId,
-            requestedByUserId: willRequestedByUserId,
-          },
-          "rejected-SIN approval guard suppressed create request",
-        );
-        await logActivity(db, {
-          companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          action: "approval.guard_suppressed",
-          entityType: "approval",
-          entityId: latestMatch.approvalId,
-          details: {
-            reason: REJECTION_GUARD_BLOCK_REASON,
-            fingerprintSinId: verdict.fingerprintSinId,
-            rejectedApprovalId: latestMatch.approvalId,
-            rejectedAt: latestMatch.rejectedAt,
-            decidedByUserId: latestMatch.decidedByUserId,
-            issueIds: uniqueIssueIds,
-          },
-        });
-        res.status(422).json({
-          error: REJECTION_GUARD_BLOCK_MESSAGE,
-          reason: REJECTION_GUARD_BLOCK_REASON,
-          fingerprintSinId: verdict.fingerprintSinId,
-          rejectedApprovalId: latestMatch.approvalId,
-          rejectedAt: latestMatch.rejectedAt.toISOString(),
-          overrideHint:
-            "Set requestedByUserId (FR-5) or wait for the rejection window to elapse.",
-        });
-        return;
-      }
-    }
-
     const approval = await svc.create(companyId, {
       ...approvalInput,
       payload: normalizedPayload,
-      requestedByUserId: willRequestedByUserId,
-      requestedByAgentId: willRequestedByAgentId,
+      requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+      requestedByAgentId:
+        approvalInput.requestedByAgentId ?? (actor.actorType === "agent" ? actor.actorId : null),
       status: "pending",
       decisionNote: null,
       decidedByUserId: null,

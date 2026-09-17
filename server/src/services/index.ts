@@ -36,20 +36,6 @@ export {
 export { goalService } from "./goals.js";
 export { activityService, type ActivityFilters } from "./activity.js";
 export { approvalService } from "./approvals.js";
-export {
-  rejectionGuardService,
-  REJECTION_GUARD_BLOCK_MESSAGE,
-  REJECTION_GUARD_BLOCK_REASON,
-  REJECTION_GUARD_DISABLE_ENV,
-  REJECTION_GUARD_WINDOW_ENV,
-  DEFAULT_REJECTION_WINDOW_DAYS,
-  extractSinToken,
-  shouldEnforceRejectionGuard,
-  type RejectionGuardCheck,
-  type RejectionGuardOptions,
-  type RejectionGuardService,
-  type RejectedSinMatch,
-} from "./rejection-guard.js";
 export { budgetService } from "./budgets.js";
 export { secretService } from "./secrets.js";
 export { routineService } from "./routines.js";
