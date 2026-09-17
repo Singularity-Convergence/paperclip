@@ -27,6 +27,15 @@ const mockSecretService = vi.hoisted(() => ({
   normalizeHireApprovalPayloadForPersistence: vi.fn(),
 }));
 
+const mockRejectionGuard = vi.hoisted(() => ({
+  extractSinToken: vi.fn(),
+  fingerprintFor: vi.fn(),
+  lookupRecentRejections: vi.fn(),
+  check: vi.fn(),
+  isGuardDisabled: vi.fn(() => false),
+  getWindowDays: vi.fn(() => 7),
+}));
+
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
@@ -38,6 +47,14 @@ function registerModuleMocks() {
     approvalService: () => mockApprovalService,
     heartbeatService: () => mockHeartbeatService,
     issueApprovalService: () => mockIssueApprovalService,
+    rejectionGuardService: () => mockRejectionGuard,
+    shouldEnforceRejectionGuard: (input: Record<string, unknown>) => {
+      if (input.bypass) return false;
+      if (input.requestedByUserId) return false;
+      return true;
+    },
+    REJECTION_GUARD_BLOCK_MESSAGE: "Approval suppressed: SIN id was rejected within the guard window.",
+    REJECTION_GUARD_BLOCK_REASON: "rejected_sin_guard",
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
   }));
@@ -131,6 +148,12 @@ describe("approval routes idempotent retries", () => {
     mockIssueApprovalService.listIssuesForApproval.mockReset();
     mockIssueApprovalService.linkManyForApproval.mockReset();
     mockSecretService.normalizeHireApprovalPayloadForPersistence.mockReset();
+    mockRejectionGuard.check.mockReset();
+    mockRejectionGuard.check.mockResolvedValue({
+      fingerprintSinId: null,
+      matches: [],
+      matched: false,
+    });
     mockLogActivity.mockReset();
     mockAccessService.decide.mockReset();
     mockAccessService.decide.mockResolvedValue({
