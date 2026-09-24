@@ -422,13 +422,24 @@ export function TaskChatComposer({
       draftKey ? loadDraftSubmission(draftKey) : null,
     );
   const mountedTaskKey = useRef(draftKey);
+  // Track whether the parent has populated confirmedSubmissionIds at least
+  // once. On the very first mount (or first task-key change) confirmedSubmissionIds
+  // is empty while comments are still loading, which would otherwise let the
+  // self-heal below misclassify a just-received submission as stale and clear
+  // it before the reconciliation effect at SIN-2321 / SIN-2322 artifact 2 can
+  // arbitrate between in-flight text and a newer draft.
+  const hasObservedConfirmedIds = useRef(false);
   useEffect(() => {
     mountedTaskKey.current = draftKey;
     if (!draftKey) {
       setUncertainSubmission(null);
+      hasObservedConfirmedIds.current = false;
       return () => {
         mountedTaskKey.current = undefined;
       };
+    }
+    if (confirmedSubmissionIds && confirmedSubmissionIds.size > 0) {
+      hasObservedConfirmedIds.current = true;
     }
     const retained = loadDraftSubmission(draftKey);
     // Self-heal a stale :submission:v1 fence on mount or task-key change.
@@ -439,8 +450,12 @@ export function TaskChatComposer({
     // A fence whose attemptId matches pendingDraftRef (in-flight) or
     // confirmedSubmissionIds (server-acknowledged) is preserved for the
     // existing reconciliation effect below to settle. SIN-2283 follow-on fix.
+    // Only run the stale-clear branch after the parent has had a chance to
+    // populate confirmedSubmissionIds; otherwise an in-flight fence whose
+    // server receipt is still in flight would be erased before reconciliation.
     if (
       retained &&
+      hasObservedConfirmedIds.current &&
       pendingDraftRef.current?.attemptId !== retained.attemptId &&
       !confirmedSubmissionIds?.has(retained.attemptId)
     ) {
