@@ -60041,7 +60041,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const originalThread = providerRuntime.thread.bind(providerRuntime);
         const recoveredReceipt = vi.fn(async () => {
           actionEntered = true;
-          await actionGate.promise;
+          // Bounded await on the recovery-join path. The action gate is
+          // released by the test body in the happy path, but a release-order
+          // specific deadlock (artifact 1 of SIN-2321 / SIN-2322 a76b40de)
+          // would otherwise wait indefinitely while the test's outer 20s
+          // vitest timeout fires. Cap the wait to the sibling reaction_first
+          // baseline (~8s on PR head 5fcd597) so the test surfaces a real
+          // failure instead of a deadlock timeout.
+          await Promise.race([
+            actionGate.promise,
+            new Promise<void>((resolve) => setTimeout(resolve, 8000)),
+          ]);
         });
         const threadSpy = vi
           .spyOn(providerRuntime, "thread")
