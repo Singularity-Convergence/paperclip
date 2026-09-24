@@ -1068,7 +1068,18 @@ export function TaskChatComposer({
     } catch (error) {
       if (mountedTaskKey.current !== draftKey) return;
       const nextDraft = bodyRef.current;
-      if (attemptId && error instanceof CommentSubmissionUnknownError) {
+      // Preserve the submission as uncertain whenever the user has typed a
+      // newer draft while delivery was pending, regardless of the error class.
+      // A page-reload cancellation or raw fetch failure is just as ambiguous
+      // as a CommentSubmissionUnknownError: the server receipt may or may not
+      // exist, and only the parent's async comment fetch can arbitrate. The
+      // post-reload reconciliation effect below settles the editor once
+      // confirmedSubmissionIds has populated (clear when accepted=true, restore
+      // only the newer draft otherwise). Without this branch the test_gate at
+      // board-attachment-receipts.spec.ts:336 reads as the
+      // concatenated-no-separator DOM described in SIN-2321 / SIN-2322
+      // a76b40de artifact 2 (deterministic on 3/3 PR runs).
+      if (attemptId && (error instanceof CommentSubmissionUnknownError || nextDraft)) {
         const uncertain = {
           attemptId, reviewed: false,
           nextDraftOffset: submittedBody.length + (nextDraft ? 2 : 0),
