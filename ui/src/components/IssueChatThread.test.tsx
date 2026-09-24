@@ -4636,6 +4636,228 @@ describe("IssueChatThread", () => {
       avatarUrl: "/avatars/alice.png",
     });
   });
+
+// SIN-2283 follow-on fix — classic-composer mirror regression suite.
+// The IssueChatComposer inside IssueChatThread has the same self-heal
+// effect as TaskChatComposer (see ui/src/components/IssueChatThread.tsx
+// IssueChatComposer mount effect). These tests verify the mirror at the
+// integration level (IssueChatThread renders the composer and the
+// composer is the unit under test). They mirror the AC-9..AC-12 tests
+// in ui/src/components/task-chat/TaskChatComposer.test.tsx.
+describe("SIN-2283 follow-on fix — classic composer (IssueChatComposer) mirror", () => {
+  type IssueChatOnAdd = Parameters<typeof IssueChatThread>[0]["onAdd"];
+  function mountThread(options: {
+    draftKey: string;
+    onAdd: IssueChatOnAdd;
+    confirmedCommentIds?: string[];
+  }) {
+    const root = createRoot(container);
+    const confirmedCommentIds = options.confirmedCommentIds ?? [];
+    const confirmedComments = confirmedCommentIds.map((id) => ({
+      ...issueChatLongThreadComments[0]!,
+      id,
+      body: "Acknowledged earlier comment",
+      authorAgentId: null,
+      authorUserId: "user-1",
+      clientRequestId: `${id}-req`,
+    }));
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <IssueChatThread
+            comments={confirmedComments}
+            currentUserId="user-1"
+            linkedRuns={[]}
+            timelineEvents={[]}
+            liveRuns={[]}
+            onAdd={options.onAdd}
+            draftKey={options.draftKey}
+            enableLiveTranscriptPolling={false}
+          />
+        </MemoryRouter>,
+      );
+    });
+    return {
+      root,
+      editor: () =>
+        container.querySelector<HTMLTextAreaElement>(
+          'textarea[aria-label="Issue chat editor"]',
+        )!,
+      send: () =>
+        Array.from(container.querySelectorAll("button")).find(
+          (b) => b.textContent === "Send",
+        ) as HTMLButtonElement,
+      type: (value: string) => {
+        const editor = container.querySelector<HTMLTextAreaElement>(
+          'textarea[aria-label="Issue chat editor"]',
+        )!;
+        Object.getOwnPropertyDescriptor(
+          window.HTMLTextAreaElement.prototype,
+          "value",
+        )!.set!.call(editor, value);
+        editor.dispatchEvent(new Event("input", { bubbles: true }));
+      },
+    };
+  }
+
+    it("AC-9 mirror: first follow-on message on a fresh draftKey dispatches onAdd without planting any prior :submission:v1 record", async () => {
+      const key = "sin-2283-ac9-classic-fresh";
+      localStorage.clear();
+      const onAdd = vi.fn().mockResolvedValue(undefined);
+      const { root, type, send } = mountThread({ draftKey: key, onAdd });
+      await act(async () => {});
+
+      expect(localStorage.getItem(`${key}:submission:v1`)).toBeNull();
+
+      await act(async () => {
+        type("First follow-on message after the description.");
+      });
+      // Send must be enabled once the body has content (the Chairman's
+      // "click the send icon does not do anything" symptom is reproduced
+      // here if the bug ever resurfaces — canSubmit depends on body.trim()).
+      expect(send().disabled).toBe(false);
+
+      await act(async () => {
+        send().click();
+      });
+
+      expect(onAdd).toHaveBeenCalledTimes(1);
+      expect(onAdd.mock.calls[0]?.[0]).toBe(
+        "First follow-on message after the description.",
+      );
+      await act(async () => root.unmount());
+    });
+
+    it("AC-10 mirror: a pre-existing stale :submission:v1 record on the classic composer mount is self-healed", async () => {
+      const key = "sin-2283-ac10-classic-stale";
+      const staleAttemptId = "11111111-2222-4333-8444-555555555555";
+      localStorage.clear();
+      localStorage.setItem(
+        `${key}:submission:v1`,
+        JSON.stringify({
+          version: 1,
+          draftKey: key,
+          attemptId: staleAttemptId,
+          reviewed: false,
+        }),
+      );
+      expect(localStorage.getItem(`${key}:submission:v1`)).not.toBeNull();
+
+      const onAdd = vi.fn().mockResolvedValue(undefined);
+      const { root, type, send } = mountThread({ draftKey: key, onAdd });
+      await act(async () => {});
+
+      // Self-heal: the stale fence is cleared on mount, no "Review
+      // conversation" banner surfaces.
+      expect(localStorage.getItem(`${key}:submission:v1`)).toBeNull();
+      expect(container.textContent).not.toContain(
+        "couldn’t confirm whether this comment was saved",
+      );
+
+      await act(async () => {
+        type("Send now that the stale fence is gone.");
+      });
+      expect(send().disabled).toBe(false);
+
+      await act(async () => {
+        send().click();
+      });
+      expect(onAdd).toHaveBeenCalledTimes(1);
+      await act(async () => root.unmount());
+    });
+
+    it("AC-11 mirror: in-flight classic-composer submit persists the :submission:v1 fence after onAdd is invoked, and a stale prior fence is self-healed first", async () => {
+      const key = "sin-2283-ac11-classic-fence-order";
+      const staleAttemptId = "99999999-aaaa-4bbb-8ccc-dddddddddddd";
+      localStorage.clear();
+      localStorage.setItem(
+        `${key}:submission:v1`,
+        JSON.stringify({
+          version: 1,
+          draftKey: key,
+          attemptId: staleAttemptId,
+          reviewed: false,
+        }),
+      );
+
+      let resolveSend!: () => void;
+      const onAdd = vi.fn().mockReturnValue(
+        new Promise<void>((resolve) => {
+          resolveSend = resolve;
+        }),
+      );
+      const { root, type, send } = mountThread({ draftKey: key, onAdd });
+      await act(async () => {});
+
+      // Self-heal removed the stale record before the user typed.
+      expect(localStorage.getItem(`${key}:submission:v1`)).toBeNull();
+
+      await act(async () => {
+        type("Persist the fence with the dispatched attemptId.");
+      });
+      await act(async () => {
+        send().click();
+      });
+
+      // After click, the in-flight fence must exist and its attemptId must
+      // match what was passed to onAdd (5th arg is attemptId/clientRequestId).
+      expect(onAdd).toHaveBeenCalledTimes(1);
+      const stored = localStorage.getItem(`${key}:submission:v1`);
+      expect(stored).not.toBeNull();
+      const parsed = JSON.parse(stored!);
+      expect(parsed.attemptId).toBe(onAdd.mock.calls[0]?.[4]);
+      expect(parsed.attemptId).not.toBe(staleAttemptId);
+
+      await act(async () => {
+        resolveSend();
+      });
+      await act(async () => {});
+      expect(localStorage.getItem(`${key}:submission:v1`)).toBeNull();
+      await act(async () => root.unmount());
+    });
+
+    it("AC-12 mirror: cross-task isolation — a stale record on draftKey A does not block draftKey B's send on the classic composer", async () => {
+      const keyA = "sin-2283-ac12-classic-task-a";
+      const keyB = "sin-2283-ac12-classic-task-b";
+      const staleA = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      localStorage.clear();
+      localStorage.setItem(
+        `${keyA}:submission:v1`,
+        JSON.stringify({
+          version: 1,
+          draftKey: keyA,
+          attemptId: staleA,
+          reviewed: false,
+        }),
+      );
+      // Sanity: no fence on B yet.
+      expect(localStorage.getItem(`${keyB}:submission:v1`)).toBeNull();
+
+      const onAdd = vi.fn().mockResolvedValue(undefined);
+      const { root, type, send } = mountThread({ draftKey: keyB, onAdd });
+      await act(async () => {});
+
+      await act(async () => {
+        type("Task B first message, no cross-talk from task A.");
+      });
+      expect(send().disabled).toBe(false);
+      await act(async () => {
+        send().click();
+      });
+
+      expect(onAdd).toHaveBeenCalledTimes(1);
+      expect(onAdd.mock.calls[0]?.[0]).toBe(
+        "Task B first message, no cross-talk from task A.",
+      );
+      // Task A's stale record remains untouched by task B's mount/self-heal.
+      expect(localStorage.getItem(`${keyA}:submission:v1`)).not.toBeNull();
+      const storedA = JSON.parse(
+        localStorage.getItem(`${keyA}:submission:v1`)!,
+      );
+      expect(storedA.attemptId).toBe(staleA);
+      await act(async () => root.unmount());
+    });
+  });
 });
 
 describe("IssueAssigneePausedNotice", () => {
