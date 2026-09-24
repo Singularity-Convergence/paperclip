@@ -737,6 +737,23 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
    * normalize or transform values cannot loop. Replaces the older blur/focus gate for the same concern.
    */
   const echoIgnoreMarkdownRef = useRef<string | null>(null);
+  // Sync MDXEditor when the controlled value diverges from its internal state
+  // outside the ref-attachment path. Without this, a parent-driven recovery that
+  // changes the value after mount (e.g. IssueChatThread / TaskChatComposer
+  // reconciliation after the parent's async comment fetch) leaves the editor's
+  // DOM on the initial markdown while the parent state has moved on — which is
+  // the root cause of the editor-recovery concatenation regression in
+  // tests/e2e/board-attachment-receipts.spec.ts (artifact 2 of SIN-2321 /
+  // SIN-2322 a76b40de). The ref-attachment path in setEditorRef above handles
+  // the initial mount; this effect handles subsequent controlled updates.
+  useEffect(() => {
+    const instance = ref.current;
+    if (!instance) return;
+    if (valueRef.current === latestValueRef.current) return;
+    echoIgnoreMarkdownRef.current = valueRef.current;
+    instance.setMarkdown(valueRef.current);
+    latestValueRef.current = valueRef.current;
+  }, [editorValue]);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [richEditorError, setRichEditorError] = useState<RichEditorError | null>(null);
