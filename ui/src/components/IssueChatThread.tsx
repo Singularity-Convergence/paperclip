@@ -4678,11 +4678,34 @@ const IssueChatComposer = forwardRef<
   const mountedTaskKey = useRef(draftKey);
   useEffect(() => {
     mountedTaskKey.current = draftKey;
-    setUncertainSubmission(draftKey ? loadDraftSubmission(draftKey) : null);
+    if (!draftKey) {
+      setUncertainSubmission(null);
+      return () => {
+        mountedTaskKey.current = undefined;
+      };
+    }
+    const retained = loadDraftSubmission(draftKey);
+    // Self-heal a stale :submission:v1 fence on mount or task-key change.
+    // Mirror of TaskChatComposer.tsx — see SIN-2283 follow-on fix. A fence
+    // whose attemptId matches pendingDraftRef (in-flight) or
+    // confirmedSubmissionIds (server-acknowledged) is preserved for the
+    // existing reconciliation effect to settle.
+    if (
+      retained &&
+      pendingDraftRef.current?.attemptId !== retained.attemptId &&
+      !confirmedSubmissionIds?.has(retained.attemptId)
+    ) {
+      clearDraftSubmission(draftKey, retained.attemptId);
+      setUncertainSubmission(null);
+      return () => {
+        mountedTaskKey.current = undefined;
+      };
+    }
+    setUncertainSubmission(retained);
     return () => {
       mountedTaskKey.current = undefined;
     };
-  }, [draftKey]);
+  }, [draftKey, confirmedSubmissionIds]);
   const bodyRef = useRef(body);
   bodyRef.current = body;
   const pendingDraftRef = useRef<{

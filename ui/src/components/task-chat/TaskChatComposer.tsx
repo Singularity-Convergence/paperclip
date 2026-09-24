@@ -424,11 +424,37 @@ export function TaskChatComposer({
   const mountedTaskKey = useRef(draftKey);
   useEffect(() => {
     mountedTaskKey.current = draftKey;
-    setUncertainSubmission(draftKey ? loadDraftSubmission(draftKey) : null);
+    if (!draftKey) {
+      setUncertainSubmission(null);
+      return () => {
+        mountedTaskKey.current = undefined;
+      };
+    }
+    const retained = loadDraftSubmission(draftKey);
+    // Self-heal a stale :submission:v1 fence on mount or task-key change.
+    // A prior session can leave a fence under this draftKey (closed-tab mid
+    // submit, navigation between mount and first send, etc.). Without this
+    // branch, the early-return guard in submit() would observe the stale
+    // fence and silently block the first user-initiated send.
+    // A fence whose attemptId matches pendingDraftRef (in-flight) or
+    // confirmedSubmissionIds (server-acknowledged) is preserved for the
+    // existing reconciliation effect below to settle. SIN-2283 follow-on fix.
+    if (
+      retained &&
+      pendingDraftRef.current?.attemptId !== retained.attemptId &&
+      !confirmedSubmissionIds?.has(retained.attemptId)
+    ) {
+      clearDraftSubmission(draftKey, retained.attemptId);
+      setUncertainSubmission(null);
+      return () => {
+        mountedTaskKey.current = undefined;
+      };
+    }
+    setUncertainSubmission(retained);
     return () => {
       mountedTaskKey.current = undefined;
     };
-  }, [draftKey]);
+  }, [draftKey, confirmedSubmissionIds]);
   const [takeoverBusy, setTakeoverBusy] = useState(false);
   const [takeoverError, setTakeoverError] = useState<string | null>(null);
   const [takeoverHeaderClaimed, setTakeoverHeaderClaimed] = useState(false);
@@ -843,6 +869,10 @@ export function TaskChatComposer({
 
   async function submit() {
     if (disabled || (pause && !canResetPausedConversation)) return;
+    // The self-heal effect above clears any stale :submission:v1 fence left
+    // over from a prior session, so reaching this guard with `retained` set
+    // means a server-acknowledged receipt from a sibling tab has re-appeared
+    // (or the user is mid-`submitting` and re-clicked). SIN-2283 follow-on fix.
     const retained =
       draftKey && !queuedEdit ? loadDraftSubmission(draftKey) : null;
     if (retained && !submitting) {
@@ -981,6 +1011,10 @@ export function TaskChatComposer({
       attemptId = crypto.randomUUID();
       if (draftKey) {
         saveDraft(draftKey, submittedBody);
+        // The self-heal effect above clears any stale :submission:v1 fence
+        // left over from a prior session, so persisting this submit()'s
+        // attemptId here is safe — a re-entrant guard cannot observe a stale
+        // record that the self-heal already removed. SIN-2283 follow-on fix.
         saveDraftSubmission(draftKey, { attemptId, reviewed: false });
       }
       // IDs come only from this composer's upload receipts, never from parsing
