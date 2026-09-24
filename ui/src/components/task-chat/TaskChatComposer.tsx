@@ -15,6 +15,7 @@ import {
   DRAFT_DEBOUNCE_MS,
   clearDraft,
   loadDraft,
+  loadRestoredDraft,
   loadDraftAttachments,
   saveDraft,
   saveDraftAttachments,
@@ -414,7 +415,11 @@ export function TaskChatComposer({
 }: TaskChatComposerProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
   const stopControl = useComposerStop(onStop, stopPending);
-  const [body, setBody] = useState(() => (draftKey ? loadDraft(draftKey) : ""));
+  // SIN-2325 Fix B: use `loadRestoredDraft` so an in-flight submission fence
+  // truncates the stored draft to the post-submission slice — otherwise a
+  // page.reload() during a pending save restores both the interrupted text
+  // and the newer draft concatenated into the editor.
+  const [body, setBody] = useState(() => (draftKey ? loadRestoredDraft(draftKey) : ""));
   const [submitting, setSubmitting] = useState(false);
   const [reviewError, setReviewError] = useState(false);
   const [uncertainSubmission, setUncertainSubmission] =
@@ -576,7 +581,7 @@ export function TaskChatComposer({
 
   useEffect(() => {
     if (!draftKey || queuedEdit) return;
-    bodyRef.current = loadDraft(draftKey);
+    bodyRef.current = loadRestoredDraft(draftKey);
     setBody(bodyRef.current);
   }, [draftKey, queuedEdit]);
 
@@ -1084,8 +1089,13 @@ export function TaskChatComposer({
 
   useEffect(() => {
     if (!uncertainSubmission || !confirmedSubmissionIds?.has(uncertainSubmission.attemptId)) return;
+    // SIN-2325 Fix B: slice from the STORED draft, not bodyRef.current — the
+    // body is already sliced via `loadRestoredDraft` on mount, so re-slicing
+    // it would discard the prefix. The stored draft still holds the full
+    // pre-submission + post-submission concatenation until settlement.
     const nextDraft = uncertainSubmission.nextDraftOffset === undefined
-      ? "" : bodyRef.current.slice(uncertainSubmission.nextDraftOffset);
+      ? ""
+      : (draftKey ? loadDraft(draftKey) : bodyRef.current).slice(uncertainSubmission.nextDraftOffset);
     if (draftKey) settleDraftSubmission(draftKey, uncertainSubmission.attemptId, nextDraft);
     setUncertainSubmission(null);
     bodyRef.current = nextDraft;

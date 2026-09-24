@@ -58,14 +58,15 @@ import { useOptionalToastActions } from "../context/ToastContext";
 import { copyTextToClipboard } from "../lib/clipboard";
 import {
   loadDraft,
+  loadRestoredDraft,
   saveDraft,
   clearDraft,
   loadDraftAttachments,
   saveDraftAttachments,
   loadDraftSubmission,
   saveDraftSubmission,
-  clearDraftSubmission,
   settleDraftSubmission,
+  clearDraftSubmission,
   type ComposerDraftSubmission,
 } from "../lib/composer-draft";
 import { CommentSubmissionUnknownError } from "../lib/comment-submit-result";
@@ -4668,7 +4669,11 @@ const IssueChatComposer = forwardRef<
   const stopControl = useComposerStop(onStop, stopPending);
   // Initialize before StrictMode's mount cleanup can flush an empty value over
   // the stored draft. The effect below handles subsequent task-key changes.
-  const [body, setBody] = useState(() => (draftKey ? loadDraft(draftKey) : ""));
+  // SIN-2325 Fix B: use `loadRestoredDraft` so an in-flight submission fence
+  // truncates the stored draft to the post-submission slice — otherwise a
+  // page.reload() during a pending save restores both the interrupted text
+  // and the newer draft concatenated into the editor.
+  const [body, setBody] = useState(() => (draftKey ? loadRestoredDraft(draftKey) : ""));
   const [submitting, setSubmitting] = useState(false);
   const [reviewError, setReviewError] = useState(false);
   const [uncertainSubmission, setUncertainSubmission] =
@@ -4824,7 +4829,7 @@ const IssueChatComposer = forwardRef<
 
   useEffect(() => {
     if (!draftKey) return;
-    setBody(loadDraft(draftKey));
+    setBody(loadRestoredDraft(draftKey));
     setComposerAttachments(
       loadDraftAttachments(draftKey).map((item) => ({
         ...item,
@@ -4837,10 +4842,15 @@ const IssueChatComposer = forwardRef<
 
   // A server receipt for this exact request settles a restored submission.
   // Text equality is not delivery proof: users may intentionally repeat text.
+  // SIN-2325 Fix B: slice from the STORED draft, not bodyRef.current — the
+  // body is already sliced via `loadRestoredDraft` on mount, so re-slicing
+  // it would discard the prefix. The stored draft still holds the full
+  // pre-submission + post-submission concatenation until settlement.
   useEffect(() => {
     if (!uncertainSubmission || !confirmedSubmissionIds.has(uncertainSubmission.attemptId)) return;
     const nextDraft = uncertainSubmission.nextDraftOffset === undefined
-      ? "" : bodyRef.current.slice(uncertainSubmission.nextDraftOffset);
+      ? ""
+      : (draftKey ? loadDraft(draftKey) : bodyRef.current).slice(uncertainSubmission.nextDraftOffset);
     if (draftKey) settleDraftSubmission(draftKey, uncertainSubmission.attemptId, nextDraft);
     setUncertainSubmission(null);
     setBody(nextDraft);

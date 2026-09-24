@@ -25,6 +25,46 @@ export function loadDraft(draftKey: string): string {
   }
 }
 
+/** On mount, restore only the post-submission portion of an in-flight draft.
+ *
+ * When a submission fence is still present at the draftKey (i.e. the owning
+ * request has not yet settled), the stored draft contains both the
+ * pre-submission text and whatever the user typed while the request was
+ * in-flight. The fence's `nextDraftOffset` records where the post-submission
+ * portion begins. Returning only that slice avoids surfacing the older
+ * interrupted text after a page reload, which would otherwise concatenate
+ * the two strings (with no separator) into the editor on remount and look
+ * like data loss to the user.
+ *
+ * If there is no fence, or the fence has no `nextDraftOffset`, the full draft
+ * is returned unchanged. If the fence has been settled, the storage has
+ * already been rewritten to contain only the post-submission text by
+ * `settleDraftSubmission`, so the slice would be empty — the full-draft
+ * branch covers that case transparently.
+ *
+ * SIN-2325 Fix B: "reload during a pending save settles its receipt and
+ * preserves a newer draft" (e2e shard 6/8). */
+export function loadRestoredDraft(draftKey: string): string {
+  const full = loadDraft(draftKey);
+  let submission: ComposerDraftSubmission | null = null;
+  try {
+    submission = loadDraftSubmission(draftKey);
+  } catch {
+    return full;
+  }
+  if (!submission || submission.nextDraftOffset === undefined) return full;
+  // The slice is only meaningful while the submission fence is still
+  // present. Once `settleDraftSubmission` runs, the fence is cleared and the
+  // stored draft is rewritten to the slice — at which point this branch
+  // would naturally fall through to `full`.
+  if (
+    submission.nextDraftOffset < 0 ||
+    submission.nextDraftOffset > full.length
+  )
+    return full;
+  return full.slice(submission.nextDraftOffset);
+}
+
 function mayWriteDraft(draftKey: string, attemptId?: string) {
   const pending = loadDraftSubmission(draftKey);
   return !pending || pending.attemptId === attemptId;

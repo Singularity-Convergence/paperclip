@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   clearDraft,
   loadDraft,
+  loadRestoredDraft,
   loadDraftAttachments,
   saveDraft,
   saveDraftAttachments,
@@ -110,5 +111,74 @@ describe("task draft upload receipts", () => {
     expect(loadDraftAttachments(key)).toEqual([]);
     saveDraft(key, `[unbound](${receipt.contentPath})`);
     expect(loadDraftAttachments(key)).toEqual([]);
+  });
+});
+
+describe("loadRestoredDraft (SIN-2325 Fix B)", () => {
+  const key = "paperclip:issue-comment-draft:restore-slice";
+  const id = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
+  beforeEach(() => localStorage.clear());
+
+  it("returns the full draft when there is no submission fence", () => {
+    saveDraft(key, "Plain unsent draft text");
+    expect(loadRestoredDraft(key)).toBe("Plain unsent draft text");
+  });
+
+  it("returns the full draft when the submission has no nextDraftOffset", () => {
+    saveDraft(key, "Draft with submission fence but no offset");
+    saveDraftSubmission(key, { attemptId: id, reviewed: false });
+    expect(loadRestoredDraft(key)).toBe("Draft with submission fence but no offset");
+  });
+
+  it("returns only the post-submission slice when nextDraftOffset is set", () => {
+    // SIN-2325 reproduction: pre-submission text + newer draft text concatenated
+    // in storage during the in-flight request. The fence records where the
+    // newer portion begins. The fix must surface only that newer slice.
+    const submitted = "One text-only save interrupted by reload.";
+    const nextDraft = "A newer draft written while delivery was pending.";
+    saveDraft(key, submitted + nextDraft);
+    saveDraftSubmission(key, {
+      attemptId: id,
+      reviewed: false,
+      nextDraftOffset: submitted.length,
+    });
+    expect(loadRestoredDraft(key)).toBe(nextDraft);
+    // Crucially NOT the concatenated form:
+    expect(loadRestoredDraft(key)).not.toBe(submitted + nextDraft);
+  });
+
+  it("falls back to the full draft when nextDraftOffset is out of range", () => {
+    saveDraft(key, "short draft");
+    saveDraftSubmission(key, {
+      attemptId: id,
+      reviewed: false,
+      nextDraftOffset: 9999,
+    });
+    expect(loadRestoredDraft(key)).toBe("short draft");
+    saveDraftSubmission(key, {
+      attemptId: id,
+      reviewed: false,
+      nextDraftOffset: -1,
+    });
+    expect(loadRestoredDraft(key)).toBe("short draft");
+  });
+
+  it("returns the full draft after the submission fence has been settled", () => {
+    // After settleDraftSubmission the fence is cleared and the storage holds
+    // only the post-submission slice, so the full-draft branch is correct.
+    const submitted = "Sent";
+    const nextDraft = "Next";
+    saveDraft(key, submitted + nextDraft);
+    saveDraftSubmission(key, {
+      attemptId: id,
+      reviewed: false,
+      nextDraftOffset: submitted.length,
+    });
+    expect(settleDraftSubmission(key, id)).toBe(true);
+    expect(loadRestoredDraft(key)).toBe(nextDraft);
+  });
+
+  it("returns an empty string when there is no draft and no fence", () => {
+    expect(loadRestoredDraft(key)).toBe("");
   });
 });
