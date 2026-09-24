@@ -60121,7 +60121,29 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const postCount = providerRuntime.posts.length;
         let settled = false;
         recoveryArmed = true;
-        sweep = service.processPendingDeliveries().then(
+        // Race the drain against a deadline so a release-order specific deadlock
+        // on the chat_endpoints row (artifact 1 of SIN-2321 / SIN-2322 a76b40de)
+        // surfaces as a deterministic failure instead of the test's outer 20s
+        // vitest timeout. The deadline matches the sibling reaction_first
+        // baseline (~8s on PR head 5fcd597); we add headroom for the ordinary
+        // drain failure to surface before tripping the deadline.
+        const SWEEP_DEADLINE_MS = 12_000;
+        let sweepTimer: ReturnType<typeof setTimeout> | undefined;
+        const sweepDeadline = new Promise<{ ok: false as const; error: Error }>(
+          (resolve) => {
+            sweepTimer = setTimeout(
+              () =>
+                resolve({
+                  ok: false as const,
+                  error: new Error(
+                    `recovery join deadlocked past ${SWEEP_DEADLINE_MS}ms (SIN-2321 artifact 1)`,
+                  ),
+                }),
+              SWEEP_DEADLINE_MS,
+            );
+          },
+        );
+        const sweepPromise = service.processPendingDeliveries().then(
           () => {
             settled = true;
             return { ok: true as const };
@@ -60131,6 +60153,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             return { ok: false as const, error };
           },
         );
+        sweep = Promise.race([sweepPromise, sweepDeadline]).finally(() => {
+          if (sweepTimer) clearTimeout(sweepTimer);
+        });
         await expect
           .poll(() => ordinaryFailed && actionEntered && reactionEntered)
           .toBe(true);
