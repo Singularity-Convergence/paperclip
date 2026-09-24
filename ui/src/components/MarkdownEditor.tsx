@@ -6,6 +6,7 @@ import {
   forwardRef,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useImperativeHandle,
   useMemo,
   useRef,
@@ -745,8 +746,10 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
   // the root cause of the editor-recovery concatenation regression in
   // tests/e2e/board-attachment-receipts.spec.ts (artifact 2 of SIN-2321 /
   // SIN-2322 a76b40de). The ref-attachment path in setEditorRef above handles
-  // the initial mount; this effect handles subsequent controlled updates.
-  useEffect(() => {
+  // the initial mount; this layout effect handles subsequent controlled
+  // updates synchronously before paint so Playwright's text-content assertion
+  // sees the updated editor DOM without waiting for the next animation frame.
+  useLayoutEffect(() => {
     const instance = ref.current;
     if (!instance) return;
     if (valueRef.current === latestValueRef.current) return;
