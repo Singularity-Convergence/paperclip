@@ -27,6 +27,7 @@ import {
   type InspectDatabaseBackupHealthOptions,
 } from "../services/database-backup-health.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { listRoutineGhostExecutionCounters } from "../services/routine-ghost-counters.js";
 import { isManagedWorkspaceInstance, resolveWorkspaceReadiness } from "../services/workspace-readiness.js";
 import {
   resolveWorkspaceReadinessLocalToken,
@@ -423,6 +424,9 @@ export function healthRoutes(
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
       },
+      // SIN-2267: per-routine ghost execution counter, exposed alongside the
+      // other runtime metrics. In-memory and resets on restart.
+      routineGhostExecutionsTotal: listRoutineGhostExecutionCounters(),
       serverInfo,
       startupRecovery,
       nativeRecovery,

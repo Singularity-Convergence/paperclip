@@ -86,6 +86,10 @@ export const instanceExperimentalSettingsSchema = z.object({
   enableWorktreeRunExecution: z.boolean().default(false),
   worktreeRunExecutionActivatedAt: z.string().datetime().nullable().default(null),
   worktreeRunExecutionActivationInstanceId: z.string().min(1).nullable().default(null),
+  // Auto-cancel routine execution issues that have remained `in_progress` for
+  // more than 90 minutes (per routine, scoped). Default off; flag-off rollout
+  // review flips it on. See SIN-2267.
+  routineStaleExecutionAutoCancel: z.boolean().default(false),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = z

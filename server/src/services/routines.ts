@@ -81,12 +81,17 @@ import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./is
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
+import { incrementRoutineGhostExecutionCounter } from "./routine-ghost-counters.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
+// Stale-execution auto-cancel (SIN-2267). 90 minutes of inactivity is enough
+// for any reasonable heartbeat run to surface real progress; anything older is
+// either a stuck run or a dead routine path, and both deserve a fresh fire.
+const ROUTINE_STALE_EXECUTION_THRESHOLD_MINUTES = 90;
 const EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE = "execution_issue_status";
 const EXECUTION_ISSUE_TRANSIENT_FAILURE_STATUSES = ["blocked", "cancelled"] as const;
 const ACTIVITY_GATE_IGNORED_ACTIONS = [
@@ -1571,6 +1576,113 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
   }
 
+  /**
+   * Auto-cancel stale routine execution issues before a new fire.
+   *
+   * "Stale" = the routine's previous `routine_execution`-origin issue that is
+   * still `in_progress` AND whose `updatedAt` is older than the configured
+   * threshold (default 90 minutes). The "no agent activity" discriminator is
+   * `updatedAt`, not `createdAt`: a live heartbeat run is constantly touching
+   * the issue row, so `updatedAt` reflects the most recent agent action and
+   * naturally excludes in-flight work from auto-cancel without an extra
+   * activity probe.
+   *
+   * The function is best-effort. A failed `issueSvc.update` for one issue
+   * never blocks the dispatch (the new execution issue must still be
+   * created); the failure is logged and the loop continues. Idempotent by
+   * construction: the WHERE filter narrows to `status = 'in_progress'`, so
+   * re-running the routine against an already-cancelled issue is a no-op.
+   *
+   * Auto-cancel is scoped per routine: it never touches issues from other
+   * routines. It is gated by the `routineStaleExecutionAutoCancel` instance
+   * experimental flag — when OFF, no scan runs and no counter increments.
+   *
+   * Returns the number of issues auto-cancelled (== counter increments).
+   */
+  async function autoCancelStaleExecutionsFor(
+    routineId: string,
+    companyId: string,
+    executor: Db = db,
+    options: {
+      now?: Date;
+      thresholdMinutes?: number;
+      featureFlagEnabled?: boolean;
+    } = {},
+  ): Promise<number> {
+    if (options.featureFlagEnabled === false) return 0;
+    if (options.featureFlagEnabled === undefined) {
+      try {
+        const settings = await instanceSettingsService(db).getExperimental();
+        if (settings.routineStaleExecutionAutoCancel !== true) return 0;
+      } catch (err) {
+        logger.warn(
+          { err, routineId, companyId },
+          "failed to read instance experimental settings; skipping stale-execution auto-cancel",
+        );
+        return 0;
+      }
+    }
+
+    const now = options.now ?? new Date();
+    const thresholdMinutes = options.thresholdMinutes ?? ROUTINE_STALE_EXECUTION_THRESHOLD_MINUTES;
+    const cutoff = new Date(now.getTime() - thresholdMinutes * 60_000);
+
+    const staleRows = await executor
+      .select({ id: issues.id, companyId: issues.companyId, title: issues.title })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "routine_execution"),
+          eq(issues.originId, routineId),
+          eq(issues.status, "in_progress"),
+          lte(issues.updatedAt, cutoff),
+        ),
+      );
+
+    if (staleRows.length === 0) return 0;
+
+    const routineShortId = routineId.split("-")[0] ?? routineId;
+    let cancelled = 0;
+
+    for (const row of staleRows) {
+      const commentBody = `Auto-cancelled: stale routine execution issue from routine ${routineShortId}. No agent activity for >${thresholdMinutes} minutes. See SIN-2267.`;
+      try {
+        await issueSvc.update(
+          row.id,
+          {
+            status: "cancelled",
+            actorAgentId: null,
+            actorUserId: null,
+          },
+          executor,
+        );
+        await issueSvc.addComment(
+          row.id,
+          commentBody,
+          { agentId: undefined, userId: undefined, runId: null },
+          { authorType: "system" },
+          executor,
+        );
+        incrementRoutineGhostExecutionCounter(routineId);
+        cancelled += 1;
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            routineId,
+            companyId,
+            issueId: row.id,
+            issueTitle: row.title,
+          },
+          "failed to auto-cancel stale routine execution issue; continuing",
+        );
+      }
+    }
+
+    return cancelled;
+  }
+
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
     return executor
       .update(routineRuns)
@@ -1872,6 +1984,23 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
+        // Stale-execution auto-cancel (SIN-2267). Best-effort: any failure
+        // here is logged and swallowed so a stuck cleanup never rolls back
+        // a fresh fire. Runs inside the transaction so the issue update
+        // commits atomically with the rest of the dispatch state.
+        try {
+          await autoCancelStaleExecutionsFor(
+            input.routine.id,
+            input.routine.companyId,
+            txDb,
+            { now: triggeredAt },
+          );
+        } catch (err) {
+          logger.warn(
+            { err, routineId: input.routine.id, companyId: input.routine.companyId },
+            "stale-execution auto-cancel scan failed; continuing dispatch",
+          );
+        }
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
