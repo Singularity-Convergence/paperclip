@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -15,7 +15,9 @@ import {
   folders,
   heartbeatRuns,
   instanceSettings,
+  issueComments,
   issueInboxArchives,
+  issueReadStates,
   issues,
   projectWorkspaces,
   projects,
@@ -35,6 +37,10 @@ import { instanceSettingsService } from "../services/instance-settings.ts";
 import * as providerRegistry from "../secrets/provider-registry.ts";
 import { routineService } from "../services/routines.ts";
 import { secretService } from "../services/secrets.ts";
+import {
+  __resetRoutineGhostExecutionCountersForTesting,
+  getRoutineGhostExecutionCounter,
+} from "../services/routine-ghost-counters.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -63,7 +69,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     } else {
       process.env.PAPERCLIP_SECRETS_PROVIDER = originalSecretsProviderEnv;
     }
+    __resetRoutineGhostExecutionCountersForTesting();
     await db.delete(activityLog);
+    await db.delete(issueComments);
     await db.delete(issueInboxArchives);
     await db.delete(secretAccessEvents);
     await db.delete(companySecretBindings);
@@ -2870,5 +2878,181 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const run = await svc.firePublicTrigger(trigger.publicId!, { payload: { source: "test" } });
 
     expect(run).toMatchObject({ source: "webhook", status: "issue_created" });
+  });
+
+  // SIN-2267: stale-execution auto-cancel + per-routine ghost counter.
+  // The flag defaults OFF, so the happy path explicitly enables it via the
+  // instance experimental settings row.
+  describe("stale-execution auto-cancel (SIN-2267)", () => {
+    async function enableAutoCancelFlag() {
+      const settings = await instanceSettingsService(db).getExperimental();
+      await db
+        .update(instanceSettings)
+        .set({
+          experimental: {
+            ...settings,
+            routineStaleExecutionAutoCancel: true,
+          },
+        })
+        .where(eq(instanceSettings.singletonKey, "default"));
+    }
+
+    async function backdateExecutionIssue(input: {
+      companyId: string;
+      routineId: string;
+      assigneeAgentId: string;
+      minutesAgo: number;
+      status?: "in_progress" | "todo";
+    }) {
+      const created = await issueService(db).create(input.companyId, {
+        projectId: null,
+        title: "stale execution",
+        description: null,
+        status: input.status ?? "in_progress",
+        priority: "medium",
+        assigneeAgentId: input.assigneeAgentId,
+        originKind: "routine_execution",
+        originId: input.routineId,
+      });
+      const updatedAt = new Date(Date.now() - input.minutesAgo * 60_000);
+      await db
+        .update(issues)
+        .set({ updatedAt, createdAt: updatedAt })
+        .where(eq(issues.id, created.id));
+      return created;
+    }
+
+    it("auto-cancels a stale routine execution issue and increments the ghost counter (happy path)", async () => {
+      const { companyId, routine, svc } = await seedFixture();
+      await enableAutoCancelFlag();
+
+      const previous = await backdateExecutionIssue({
+        companyId,
+        routineId: routine.id,
+        assigneeAgentId: routine.assigneeAgentId,
+        minutesAgo: 120,
+      });
+
+      expect(getRoutineGhostExecutionCounter(routine.id)).toBe(0);
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" });
+
+      // (a) New execution issue is created.
+      expect(run.status).toBe("issue_created");
+      expect(run.linkedIssueId).not.toBeNull();
+      expect(run.linkedIssueId).not.toBe(previous.id);
+
+      // (b) The old execution issue is now cancelled with the expected comment.
+      const [cancelledOld] = await db.select().from(issues).where(eq(issues.id, previous.id));
+      expect(cancelledOld.status).toBe("cancelled");
+      const [comment] = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.issueId, previous.id));
+      const routineShortId = routine.id.split("-")[0];
+      expect(comment?.body).toContain(routineShortId);
+      expect(comment?.body).toContain("SIN-2267");
+      expect(comment?.body).toContain(">90 minutes");
+      expect(comment?.authorType).toBe("system");
+
+      // (c) Counter incremented by 1.
+      expect(getRoutineGhostExecutionCounter(routine.id)).toBe(1);
+    });
+
+    it("does not cancel a routine execution issue that has recent agent activity (live-work path)", async () => {
+      const { companyId, routine, svc } = await seedFixture();
+      await enableAutoCancelFlag();
+
+      // Backdate the createdAt AND updatedAt 120 minutes ago...
+      const previous = await backdateExecutionIssue({
+        companyId,
+        routineId: routine.id,
+        assigneeAgentId: routine.assigneeAgentId,
+        minutesAgo: 120,
+      });
+      // ...then post fresh agent activity (a comment) within the last 5 minutes.
+      // The comment insert bumps the issue's updatedAt back to "now", so the
+      // updatedAt-based threshold must skip it.
+      await issueService(db).addComment(
+        previous.id,
+        "Live agent activity — DO NOT CANCEL.",
+        { agentId: routine.assigneeAgentId, userId: undefined, runId: null },
+      );
+
+      expect(getRoutineGhostExecutionCounter(routine.id)).toBe(0);
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" });
+
+      // The old issue must remain in_progress and untouched. updatedAt-based
+      // semantics make the recent comment the discriminator: as long as the
+      // heartbeat run keeps touching the row, auto-cancel never fires on it.
+      const [stillOpen] = await db.select().from(issues).where(eq(issues.id, previous.id));
+      expect(stillOpen.status).toBe("in_progress");
+
+      // The previous issue has no LIVE heartbeat run attached (the test fixture
+      // does not create one), so `findLiveExecutionIssue` does not coalesce
+      // and a fresh execution issue is created instead.
+      expect(run.status).toBe("issue_created");
+      expect(run.linkedIssueId).not.toBe(previous.id);
+
+      // No ghost auto-cancel happened — the live comment kept the row fresh.
+      expect(getRoutineGhostExecutionCounter(routine.id)).toBe(0);
+    });
+
+    it("does not cancel a routine execution issue that is under the stale threshold (boundary case)", async () => {
+      const { companyId, routine, svc } = await seedFixture();
+      await enableAutoCancelFlag();
+
+      // 45 minutes ago is well under the 90-minute threshold.
+      const previous = await backdateExecutionIssue({
+        companyId,
+        routineId: routine.id,
+        assigneeAgentId: routine.assigneeAgentId,
+        minutesAgo: 45,
+      });
+
+      expect(getRoutineGhostExecutionCounter(routine.id)).toBe(0);
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" });
+
+      // (a) New execution issue is created.
+      expect(run.status).toBe("issue_created");
+      expect(run.linkedIssueId).not.toBeNull();
+      expect(run.linkedIssueId).not.toBe(previous.id);
+
+      // (b) The old issue is still in_progress.
+      const [stillOpen] = await db.select().from(issues).where(eq(issues.id, previous.id));
+      expect(stillOpen.status).toBe("in_progress");
+
+      // (c) Counter did NOT increment.
+      expect(getRoutineGhostExecutionCounter(routine.id)).toBe(0);
+    });
+
+    it("does not auto-cancel when the feature flag is OFF (default)", async () => {
+      const { companyId, routine, svc } = await seedFixture();
+      // Intentionally do NOT enable the flag — the schema default is OFF.
+
+      const previous = await backdateExecutionIssue({
+        companyId,
+        routineId: routine.id,
+        assigneeAgentId: routine.assigneeAgentId,
+        minutesAgo: 120,
+      });
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" });
+
+      // The old issue stays in_progress; the new fire is unaffected.
+      const [stillOpen] = await db.select().from(issues).where(eq(issues.id, previous.id));
+      expect(stillOpen.status).toBe("in_progress");
+
+      // The previous issue has no LIVE heartbeat run attached, so the dispatch
+      // creates a fresh execution issue rather than coalescing into the old one.
+      expect(run.status).toBe("issue_created");
+      expect(run.linkedIssueId).not.toBe(previous.id);
+
+      // The ghost counter is untouched — the flag-off path never reads or
+      // increments it.
+      expect(getRoutineGhostExecutionCounter(routine.id)).toBe(0);
+    });
   });
 });

@@ -264,6 +264,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       worktreeRunExecutionActivatedAt: parsed.data.worktreeRunExecutionActivatedAt ?? null,
       worktreeRunExecutionActivationInstanceId:
         parsed.data.worktreeRunExecutionActivationInstanceId ?? null,
+      routineStaleExecutionAutoCancel: parsed.data.routineStaleExecutionAutoCancel ?? false,
     };
   }
   return {
@@ -305,6 +306,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableWorktreeRunExecution: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,
+    routineStaleExecutionAutoCancel: false,
   };
 }
 

@@ -71,6 +71,7 @@ describe("instance settings service", () => {
       enableWorktreeRunExecution: false,
       worktreeRunExecutionActivatedAt: null,
       worktreeRunExecutionActivationInstanceId: null,
+      routineStaleExecutionAutoCancel: false,
     });
   });
 

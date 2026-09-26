@@ -145,6 +145,13 @@ export interface InstanceExperimentalSettings {
    * from another instance fail closed.
    */
   worktreeRunExecutionActivationInstanceId: string | null;
+  /**
+   * Auto-cancel routine execution issues that have remained `in_progress` for
+   * more than 90 minutes with no recent agent activity (per routine, scoped;
+   * SIN-2267). Increments the `paperclip_routine_ghost_executions_total`
+   * counter visible on the instance health endpoint.
+   */
+  routineStaleExecutionAutoCancel: boolean;
 }
 
 /**
