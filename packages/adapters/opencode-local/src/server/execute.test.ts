@@ -324,3 +324,116 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
     ).rejects.toThrow("Configured OpenCode model is unavailable on the remote execution target");
   });
 });
+
+describe("execute — wake-prompt cap wiring", () => {
+  let overflowDir: string;
+  let configHome: string;
+
+  beforeEach(async () => {
+    configHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-cap-config-"));
+    overflowDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-cap-overflow-"));
+    vi.stubEnv("XDG_CONFIG_HOME", configHome);
+    runProcessMock.mockReset();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fs.rm(configHome, { recursive: true, force: true });
+    await fs.rm(overflowDir, { recursive: true, force: true });
+  });
+
+  it("captures wakePromptOriginalBytes / wakePromptCappedBytes / wakePromptTruncated in onMeta.promptMetrics", async () => {
+    const commandPath = path.join(configHome, "fake-opencode");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockResolvedValueOnce(probeResult({
+      stdout: JSON.stringify({ type: "text", sessionID: "cap-run", part: { text: "done" } }),
+    }));
+
+    let promptMetrics: Record<string, unknown> | undefined;
+    let prompt = "";
+    const result = await execute({
+      runId: "cap-run",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: commandPath,
+        cwd: configHome,
+        model: "openai/gpt-5",
+        env: {
+          OPENCODE_ALLOW_ALL_MODELS: "1",
+          PAPERCLIP_WAKE_COMMENT_MAX_BYTES: "8",
+          PAPERCLIP_WAKE_OVERFLOW_DIR: overflowDir,
+        },
+      },
+      context: {
+        conversationMode: true,
+        paperclipTaskMarkdown: "short task directive",
+        paperclipWake: {
+          reason: "issue_assigned",
+          issue: { id: "cap-issue", status: "in_progress", workMode: "standard", title: "Cap wiring" },
+        },
+      },
+      onLog: async () => {},
+      onMeta: async (meta) => {
+        prompt = String(meta.prompt ?? "");
+        promptMetrics = meta.promptMetrics as Record<string, unknown>;
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(promptMetrics).toBeDefined();
+    expect(promptMetrics?.wakePromptCapBytes).toBe(8);
+    expect(promptMetrics?.wakePromptTruncated).toBe(1);
+    expect(typeof promptMetrics?.wakePromptOriginalBytes).toBe("number");
+    expect((promptMetrics?.wakePromptOriginalBytes as number) > 8).toBe(true);
+    expect((promptMetrics?.wakePromptCappedBytes as number)).toBeLessThan(
+      promptMetrics?.wakePromptOriginalBytes as number,
+    );
+    expect(prompt).toContain("[Paperclip wake payload truncated]");
+    const overflowFiles = await fs.readdir(overflowDir);
+    expect(overflowFiles.length).toBe(1);
+    expect(overflowFiles[0]).toMatch(/^cap-run-/);
+  });
+
+  it("leaves wakePromptTruncated=0 when wake prompt is under the cap", async () => {
+    const commandPath = path.join(configHome, "fake-opencode");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockResolvedValueOnce(probeResult({
+      stdout: JSON.stringify({ type: "text", sessionID: "under-run", part: { text: "done" } }),
+    }));
+
+    let promptMetrics: Record<string, unknown> | undefined;
+    await execute({
+      runId: "under-run",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: commandPath,
+        cwd: configHome,
+        model: "openai/gpt-5",
+        env: {
+          OPENCODE_ALLOW_ALL_MODELS: "1",
+          PAPERCLIP_WAKE_COMMENT_MAX_BYTES: "16384",
+        },
+      },
+      context: {
+        conversationMode: true,
+        paperclipTaskMarkdown: "tiny",
+        paperclipWake: {
+          reason: "issue_assigned",
+          issue: { id: "under-issue", status: "in_progress", workMode: "standard" },
+        },
+      },
+      onLog: async () => {},
+      onMeta: async (meta) => {
+        promptMetrics = meta.promptMetrics as Record<string, unknown>;
+      },
+    });
+    expect(promptMetrics).toBeDefined();
+    expect(promptMetrics?.wakePromptTruncated).toBe(0);
+    expect((promptMetrics?.wakePromptOriginalBytes as number)).toBe(
+      promptMetrics?.wakePromptCappedBytes,
+    );
+    const overflowFiles = await fs.readdir(overflowDir);
+    expect(overflowFiles.length).toBe(0);
+  });
+});
