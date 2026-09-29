@@ -62,6 +62,7 @@ import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/se
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveOpenCodeSkillsHome } from "./skills.js";
+import { applyWakeCommentMaxBytesCap } from "./wake-payload-cap.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -574,11 +575,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const taskContextNote = context.conversationMode === true
       ? selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId), includeCommunicationGuidance: false })
       : "";
-    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+    const wakePromptRaw = renderPaperclipWakePrompt(context.paperclipWake, {
       conversationMode: context.conversationMode === true,
       resumedSession: Boolean(sessionId),
       suppressIssueDescription: taskContextNote.length > 0,
     });
+    const wakeCap = await applyWakeCommentMaxBytesCap({
+      runId,
+      wakePrompt: wakePromptRaw,
+      env,
+    });
+    const wakePrompt = wakeCap.wakePrompt;
     const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
     const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
       ? ""
@@ -597,6 +604,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       instructionsChars: instructionsPrefix.length,
       bootstrapPromptChars: renderedBootstrapPrompt.length,
       wakePromptChars: wakePrompt.length,
+      wakePromptOriginalBytes: wakeCap.originalBytes,
+      wakePromptCappedBytes: wakeCap.cappedBytes,
+      wakePromptCapBytes: wakeCap.capBytes,
+      wakePromptTruncated: wakeCap.truncated ? 1 : 0,
       taskContextChars: taskContextNote.length,
       sessionHandoffChars: sessionHandoffNote.length,
       heartbeatPromptChars: renderedPrompt.length,
